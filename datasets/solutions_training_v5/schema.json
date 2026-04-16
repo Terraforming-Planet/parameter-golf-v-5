@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "solutions_training_v5 schema (placeholder)",
+  "type": "object",
+  "description": "Placeholder schema for the auxiliary V5 dataset package. To be finalized in Phase 2.",
+  "required": ["version", "track", "records"],
+  "properties": {
+    "version": { "type": "string" },
+    "track": {
+      "type": "string",
+      "enum": ["auxiliary_experimental_v5"]
+    },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "input", "target"],
+        "properties": {
+          "id": { "type": "string" },
+          "input": { "type": "string" },
+          "target": { "type": "string" },
+          "tags": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}

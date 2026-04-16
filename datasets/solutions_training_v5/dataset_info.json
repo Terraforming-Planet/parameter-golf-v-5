@@ -1,0 +1,10 @@
+{
+  "name": "solutions_training_v5",
+  "status": "placeholder",
+  "track": "auxiliary_experimental_v5",
+  "official_benchmark": "fineweb",
+  "notes": [
+    "Actual dataset ZIP/package export will be added later.",
+    "This path is experimental and separate from official FineWeb submissions."
+  ]
+}

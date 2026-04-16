@@ -1,0 +1,12 @@
+{
+  "name": "reference_baseline_carried_over",
+  "github_id": "placeholder",
+  "track": "reference_baseline",
+  "is_v5_claim": false,
+  "val_bpb": 1.22064591,
+  "notes": [
+    "Carried-over reference baseline from prior work.",
+    "Not a claimed V5 submission result.",
+    "Replace with official V5 artifact metadata when available."
+  ]
+}
