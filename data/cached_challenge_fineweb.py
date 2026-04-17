@@ -102,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--variant",
         default="sp1024",
-        help="Tokenizer family to download, for example sp1024, sp4096, or byte260.",
+        help="Tokenizer family to download, for example sp1024, sp4096, sp8192, or byte260.",
     )
     parser.add_argument(
         "--skip-manifest",
