@@ -58,6 +58,14 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    parallel_residual = bool(int(os.environ.get("PARALLEL_RESIDUAL", "0")))
+    recurrence_layers_raw = os.environ.get("RECURRENCE_LAYERS", "").strip()
+    recurrence_layers = (
+        tuple(int(idx.strip()) for idx in recurrence_layers_raw.split(",") if idx.strip())
+        if recurrence_layers_raw
+        else tuple()
+    )
+    recurrence_steps = int(os.environ.get("RECURRENCE_STEPS", 1))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -81,10 +89,12 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_wd = float(os.environ.get("MUON_WD", 0.0))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    scalar_wd = float(os.environ.get("SCALAR_WD", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -110,10 +120,18 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+    ):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay),
         )
 
     @torch.no_grad()
@@ -135,6 +153,7 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            weight_decay = group["weight_decay"]
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -162,6 +181,8 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                if weight_decay != 0.0:
+                    p.mul_(1.0 - lr * weight_decay)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -626,6 +647,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        parallel_residual: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -635,13 +657,20 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.parallel_residual = parallel_residual
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if self.parallel_residual:
+            attn_out = self.attn(self.attn_norm(x))
+            mlp_out = self.mlp(self.mlp_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        else:
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -659,6 +688,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        parallel_residual: bool,
+        recurrence_layers: tuple[int, ...],
+        recurrence_steps: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,6 +698,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.recurrence_layers = set(recurrence_layers)
+        self.recurrence_steps = recurrence_steps
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -680,6 +714,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    parallel_residual,
                 )
                 for i in range(num_layers)
             ]
@@ -705,12 +740,17 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            repeats = self.recurrence_steps if i in self.recurrence_layers else 1
+            for _ in range(repeats):
+                x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            block_idx = self.num_encoder_layers + i
+            repeats = self.recurrence_steps if block_idx in self.recurrence_layers else 1
+            for _ in range(repeats):
+                x = self.blocks[block_idx](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -733,6 +773,11 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.recurrence_steps < 1:
+        raise ValueError(f"RECURRENCE_STEPS must be >= 1, got {args.recurrence_steps}")
+    invalid_recurrence = [i for i in args.recurrence_layers if i < 0 or i >= args.num_layers]
+    if invalid_recurrence:
+        raise ValueError(f"RECURRENCE_LAYERS out of range for NUM_LAYERS={args.num_layers}: {invalid_recurrence}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -835,6 +880,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        parallel_residual=args.parallel_residual,
+        recurrence_layers=args.recurrence_layers,
+        recurrence_steps=args.recurrence_steps,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -873,6 +921,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.muon_wd,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -881,6 +930,7 @@ def main() -> None:
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
+        weight_decay=args.scalar_wd,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
@@ -898,9 +948,14 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
+        f"parallel_residual:{args.parallel_residual} recurrence_layers:{list(args.recurrence_layers)} "
+        f"recurrence_steps:{args.recurrence_steps}"
+    )
+    log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"muon_wd:{args.muon_wd} scalar_wd:{args.scalar_wd}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
